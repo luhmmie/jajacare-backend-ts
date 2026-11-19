@@ -1,0 +1,331 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────── Enums ─────────────
+
+enum Role {
+  ADMIN
+  RECEPTIONIST
+  NURSE
+  DOCTOR
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum BloodGroup {
+  A_POS
+  A_NEG
+  B_POS
+  B_NEG
+  AB_POS
+  AB_NEG
+  O_POS
+  O_NEG
+}
+
+enum Genotype {
+  AA
+  AS
+  SS
+  AC
+  SC
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  CHECKED_IN
+  IN_CONSULTATION
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum ConsultationStatus {
+  DRAFT
+  COMPLETED
+}
+
+// ───────────── Staff & auth ─────────────
+
+model User {
+  id                  String    @id @default(uuid()) @db.Uuid
+  staffId             String    @unique
+  email               String    @unique
+  passwordHash        String
+  fullName            String
+  phone               String?
+  role                Role
+  isActive            Boolean   @default(true)
+  mustChangePassword  Boolean   @default(true)
+  failedLoginCount    Int       @default(0)
+  lockedUntil         DateTime?
+  lastLoginAt         DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  refreshTokens       RefreshToken[]
+  resetTokens         PasswordResetToken[]
+  patientsCreated     Patient[]       @relation("PatientCreatedBy")
+  appointmentsAsDoctor Appointment[]  @relation("AppointmentDoctor")
+  appointmentsCreated Appointment[]   @relation("AppointmentCreatedBy")
+  consultations       Consultation[]
+  vitalsRecorded      Vitals[]
+  auditLogs           AuditLog[]
+
+  @@index([role, isActive])
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  familyId   String    @db.Uuid // one family per login; reuse of a rotated token revokes the whole family
+  tokenHash  String    @unique // SHA-256 of the opaque token; the raw token is never stored
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+}
+
+model PasswordResetToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ───────────── Patients ─────────────
+
+model Patient {
+  id               String     @id @default(uuid()) @db.Uuid
+  patientNo        String     @unique // JC-2026-0001
+  firstName        String
+  lastName         String
+  gender           Gender
+  dateOfBirth      DateTime   @db.Date
+  phone            String
+  matricNumber     String?    @unique // nullable: staff patients have none. Postgres allows many NULLs under UNIQUE.
+  staffNumber      String?    @unique
+  faculty          String
+  department       String
+  hallOfResidence  String?
+  bloodGroup       BloodGroup?
+  genotype         Genotype?
+  createdById      String     @db.Uuid
+  deletedAt        DateTime?  // soft delete: medical records are never hard-deleted
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  createdBy        User       @relation("PatientCreatedBy", fields: [createdById], references: [id])
+  emergencyContact EmergencyContact?
+  allergies        PatientAllergy[]
+  chronicConditions ChronicCondition[]
+  appointments     Appointment[]
+  consultations    Consultation[]
+
+  @@index([lastName, firstName])
+  @@index([faculty])
+  @@index([createdAt])
+  @@index([deletedAt])
+}
+
+model EmergencyContact {
+  id           String  @id @default(uuid()) @db.Uuid
+  patientId    String  @unique @db.Uuid
+  name         String
+  relationship String
+  phone        String
+
+  patient      Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+}
+
+model PatientAllergy {
+  id         String  @id @default(uuid()) @db.Uuid
+  patientId  String  @db.Uuid
+  substance  String
+  reaction   String?
+
+  patient    Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([patientId])
+}
+
+model ChronicCondition {
+  id         String  @id @default(uuid()) @db.Uuid
+  patientId  String  @db.Uuid
+  name       String
+
+  patient    Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([patientId])
+}
+
+// Race-safe sequence for patient numbers: one row per year, incremented inside the registration transaction.
+model PatientIdCounter {
+  year    Int @id
+  lastSeq Int @default(0)
+}
+
+// ───────────── Appointments & visit ─────────────
+
+model Appointment {
+  id            String            @id @default(uuid()) @db.Uuid
+  patientId     String            @db.Uuid
+  doctorId      String            @db.Uuid
+  startsAt      DateTime
+  endsAt        DateTime
+  reason        String
+  status        AppointmentStatus @default(SCHEDULED)
+  cancelReason  String?
+  checkedInAt   DateTime?         // queue order = checkedInAt ASC
+  createdById   String            @db.Uuid
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  patient       Patient           @relation(fields: [patientId], references: [id])
+  doctor        User              @relation("AppointmentDoctor", fields: [doctorId], references: [id])
+  createdBy     User              @relation("AppointmentCreatedBy", fields: [createdById], references: [id])
+  vitals        Vitals?
+  consultation  Consultation?
+
+  // NOTE: double-booking is enforced by a Postgres EXCLUDE constraint added in the
+  // init migration (Prisma cannot express it). See prisma/migrations/*_init.
+  @@index([doctorId, startsAt])
+  @@index([patientId])
+  @@index([status, startsAt])
+}
+
+// Vitals belong to the visit (appointment), not the consultation:
+// nurses record them at check-in, before the doctor opens a consultation.
+model Vitals {
+  id            String      @id @default(uuid()) @db.Uuid
+  appointmentId String      @unique @db.Uuid
+  temperatureC  Decimal?    @db.Decimal(4, 1)
+  systolic      Int?
+  diastolic     Int?
+  pulse         Int?
+  weightKg      Decimal?    @db.Decimal(5, 1)
+  heightCm      Decimal?    @db.Decimal(5, 1)
+  bmi           Decimal?    @db.Decimal(4, 1)
+  recordedById  String      @db.Uuid
+  recordedAt    DateTime    @default(now())
+
+  appointment   Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  recordedBy    User        @relation(fields: [recordedById], references: [id])
+}
+
+model Consultation {
+  id               String             @id @default(uuid()) @db.Uuid
+  appointmentId    String             @unique @db.Uuid
+  patientId        String             @db.Uuid
+  doctorId         String             @db.Uuid
+  status           ConsultationStatus @default(DRAFT)
+  complaints       String?
+  complaintDuration String?
+  doctorNotes      String?
+  completedAt      DateTime?          // once set, the record is immutable
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  appointment      Appointment        @relation(fields: [appointmentId], references: [id])
+  patient          Patient            @relation(fields: [patientId], references: [id])
+  doctor           User               @relation(fields: [doctorId], references: [id])
+  diagnoses        Diagnosis[]
+  prescriptions    Prescription[]
+
+  @@index([patientId, createdAt])
+  @@index([doctorId])
+}
+
+model Diagnosis {
+  id             String       @id @default(uuid()) @db.Uuid
+  consultationId String       @db.Uuid
+  name           String
+  code           String?      // e.g. ICD-10, optional
+
+  consultation   Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+
+  @@index([consultationId])
+  @@index([name])
+}
+
+model Prescription {
+  id             String       @id @default(uuid()) @db.Uuid
+  consultationId String       @db.Uuid
+  drug           String
+  dose           String
+  frequency      String
+  duration       String
+
+  consultation   Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+
+  @@index([consultationId])
+}
+
+// ───────────── Settings & audit ─────────────
+
+// Singleton row (id is always 1).
+model ClinicSettings {
+  id           Int      @id @default(1)
+  clinicName   String   @default("Jaja Clinic, University of Ibadan")
+  openTime     String   @default("08:00") // HH:mm
+  closeTime    String   @default("16:00")
+  slotMinutes  Int      @default(20)
+  workingDays  Int[]    @default([1, 2, 3, 4, 5]) // 0 = Sunday
+  // Shown publicly on the landing page footer / contact section.
+  address      String?
+  contactEmail String?
+  contactPhone String?
+  updatedAt    DateTime @updatedAt
+}
+
+// Messages sent from the public landing-page contact form.
+model ContactMessage {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String
+  email     String
+  message   String    @db.Text
+  ip        String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([createdAt])
+  @@index([readAt])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String?  @db.Uuid
+  action     String   // e.g. "patient.create", "auth.login.failed"
+  entity     String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entity, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+}

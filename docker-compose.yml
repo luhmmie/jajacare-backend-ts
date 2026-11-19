@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: jajacare
+      POSTGRES_PASSWORD: jajacare
+      POSTGRES_DB: jajacare
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro   # also creates the jajacare_test database on first start
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jajacare"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # `docker compose up --build` runs the whole stack; `npm run db:up` starts only the database.
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://jajacare:jajacare@db:5432/jajacare?schema=public
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET in .env}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+
+volumes:
+  pgdata:
